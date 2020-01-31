@@ -1,5 +1,5 @@
 /********************************************************************************
- * Copyright (C) 2018 TypeFox and others.
+ * Copyright (C) 2020 Ericsson and others.
  *
  * This program and the accompanying materials are made available under the
  * terms of the Eclipse Public License v. 2.0 which is available at
@@ -16,28 +16,37 @@
 
 import { injectable } from 'inversify';
 import URI from '@theia/core/lib/common/uri';
-import { MiniBrowserEndpoint } from '@theia/mini-browser/lib/browser/location-mapper-service';
-import { environment } from '@theia/core';
+import { MaybePromise } from '@theia/core/lib/common/types';
+import { LocationMapper } from '../browser/location-mapper-service';
 
+/**
+ * Location mapper for locations without a scheme.
+ */
 @injectable()
-export class PreviewLinkNormalizer {
+export class ElectronLocationWithoutSchemeMapper implements LocationMapper {
 
-    protected urlScheme = new RegExp('^[a-z][a-z|0-9|\+|\-|\.]*:', 'i');
-
-    normalizeLink(documentUri: URI, link: string): string {
-        try {
-            if (!this.urlScheme.test(link)) {
-                const location = documentUri.parent.resolve(link).path.toString();
-                if (environment.electron.is()) {
-                    // On Electron, there is not backend HTTP endpoint.
-                    return location;
-                } else {
-                    return new MiniBrowserEndpoint().getRestUrl().resolve(location).toString();
-                }
-            }
-        } catch {
-            // ignore
-        }
-        return link;
+    canHandle(location: string): MaybePromise<number> {
+        return new URI(location).scheme === '' ? 1 : 0;
     }
+
+    map(location: string): MaybePromise<string> {
+        return `file://${location}`;
+    }
+
+}
+
+/**
+ * `file` URI location mapper.
+ */
+@injectable()
+export class ElectronFileLocationMapper implements LocationMapper {
+
+    canHandle(location: string): MaybePromise<number> {
+        return location.startsWith('file://') ? 1 : 0;
+    }
+
+    map(location: string): MaybePromise<string> {
+        return location;
+    }
+
 }

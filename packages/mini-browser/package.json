@@ -14,8 +14,13 @@
   },
   "theiaExtensions": [
     {
-      "backend": "lib/node/mini-browser-backend-module",
       "frontend": "lib/browser/mini-browser-frontend-module"
+    },
+    {
+      "frontend": "lib/browser/mini-browser-endpoint-module",
+      "frontendElectron": "lib/electron-browser/electron-mini-browser-endpoint-module",
+      "backend": "lib/node/mini-browser-backend-module",
+      "backendElectron": "lib/electron-node/electron-mini-browser-backend-module"
     }
   ],
   "keywords": [
