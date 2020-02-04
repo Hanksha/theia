@@ -87,7 +87,8 @@ describe('git', async function (): Promise<void> {
             await initRepository(path.join(root, 'BASE', 'C'));
             const workspaceRootUri = FileUri.create(path.join(root, 'BASE')).toString();
             const repositories = await git.repositories(workspaceRootUri, {});
-            expect(repositories.map(r => path.basename(FileUri.fsPath(r.localUri))).sort()).to.deep.equal(['A', 'B', 'BASE', 'C']);
+            const baseNames = new Set(repositories.map(r => path.basename(FileUri.fsPath(r.localUri))).sort());
+            expect(Array.from(baseNames)).to.deep.equal(['A', 'B', 'BASE', 'C']);
 
         });
 
