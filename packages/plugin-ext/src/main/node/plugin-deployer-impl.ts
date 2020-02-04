@@ -17,6 +17,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { injectable, optional, multiInject, inject } from 'inversify';
+import { PluginPathsService } from '../common/plugin-paths-protocol';
 import {
     PluginDeployerResolver, PluginDeployerFileHandler, PluginDeployerDirectoryHandler,
     PluginDeployerEntry, PluginDeployer, PluginDeployerResolverInit, PluginDeployerFileHandlerContext,
@@ -33,6 +34,7 @@ import { PluginDeployerDirectoryHandlerContextImpl } from './plugin-deployer-dir
 import { ILogger, Emitter } from '@theia/core';
 import { PluginCliContribution } from './plugin-cli-contribution';
 import { performance } from 'perf_hooks';
+import * as path from 'path';
 
 @injectable()
 export class PluginDeployerImpl implements PluginDeployer {
@@ -48,6 +50,9 @@ export class PluginDeployerImpl implements PluginDeployer {
 
     @inject(PluginCliContribution)
     protected readonly cliContribution: PluginCliContribution;
+
+    @inject(PluginPathsService)
+    protected readonly pluginPathsService: PluginPathsService;
 
     /**
      * Inject all plugin resolvers found at runtime.
@@ -102,11 +107,24 @@ export class PluginDeployerImpl implements PluginDeployer {
         // transform it to array
         const defaultPluginIdList = defaultPluginsValue ? defaultPluginsValue.split(',') : [];
         const pluginIdList = pluginsValue ? pluginsValue.split(',') : [];
-        const pluginsList = defaultPluginIdList.concat(pluginIdList).concat(defaultPluginsValueViaCli ? defaultPluginsValueViaCli.split(',') : []);
+        const pluginIdListViaCli = defaultPluginsValueViaCli ? defaultPluginsValueViaCli.split(',') : [];
+        const pluginsList = await this.resolvePluginIdList([pluginIdListViaCli, pluginIdList, defaultPluginIdList]);
 
         const startDeployTime = performance.now();
         await this.deployMultipleEntries(pluginsList);
         this.logMeasurement('Deploy plugins list', startDeployTime);
+    }
+
+    /**
+     * Puts together user-configurable and non-user-configurable plugin paths.
+     *
+     * @param pluginIdLists
+     */
+    protected async resolvePluginIdList(pluginIdLists: string[][]): Promise<string[]> {
+        return ([] as string[]).concat(
+            [path.join(await this.pluginPathsService.getTheiaDirPath(), 'extensions')],
+            ...pluginIdLists
+        );
     }
 
     public async deploy(pluginEntry: string): Promise<void> {
@@ -121,7 +139,7 @@ export class PluginDeployerImpl implements PluginDeployer {
 
         let queue = [...pluginEntries];
         while (queue.length) {
-            const dependenciesChunk: Array< Map<string, string>> = [];
+            const dependenciesChunk: Array<Map<string, string>> = [];
             const workload: string[] = [];
             while (queue.length) {
                 const current = queue.shift()!;
