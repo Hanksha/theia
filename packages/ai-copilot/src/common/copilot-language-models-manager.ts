@@ -42,6 +42,10 @@ export interface CopilotModelDescription {
      */
     model: string;
     /**
+     * The vendor of the model (e.g., 'OpenAI', 'Anthropic').
+     */
+    vendor?: string;
+    /**
      * Indicate whether the streaming API shall be used.
      */
     enableStreaming: boolean;
@@ -53,6 +57,19 @@ export interface CopilotModelDescription {
      * Maximum number of retry attempts when a request fails.
      */
     maxRetries: number;
+    /**
+     * Flag to configure whether the model should use the response API instead of the chat completions API.
+     */
+    useResponseApi?: boolean;
+}
+
+export interface CopilotModelData {
+    id: string;
+    vendor?: string;
+    useResponseApi?: boolean;
+    supportsStructuredOutput?: boolean;
+    supportsReasoning?: boolean;
+    supportsStreaming?: boolean;
 }
 
 export interface CopilotLanguageModelsManager {
@@ -77,5 +94,5 @@ export interface CopilotLanguageModelsManager {
      * Requires authentication. Returns an empty array if not authenticated
      * or if the API call fails.
      */
-    fetchAvailableModelIds(): Promise<string[]>;
+    fetchAvailableModels(): Promise<CopilotModelData[]>;
 }

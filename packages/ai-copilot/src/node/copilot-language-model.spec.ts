@@ -18,6 +18,8 @@ import { expect } from 'chai';
 import { LanguageModelMessage } from '@theia/ai-core';
 import { ChatCompletionMessageParam } from 'openai/resources';
 import { CopilotLanguageModel } from './copilot-language-model';
+import { OpenAiModelUtils } from '@theia/ai-openai/lib/node/openai-language-model';
+import { OpenAiResponseApiUtils } from '@theia/ai-openai/lib/node/openai-response-api-utils';
 
 class TestableCopilotLanguageModel extends CopilotLanguageModel {
     constructor() {
@@ -28,6 +30,9 @@ class TestableCopilotLanguageModel extends CopilotLanguageModel {
             true,
             false,
             3,
+            new OpenAiModelUtils(),
+            new OpenAiResponseApiUtils(),
+            false,
             async () => 'test-token',
             () => undefined,
             () => 'test-user-agent'

@@ -17,10 +17,27 @@
 import { LanguageModelRegistry, LanguageModelStatus } from '@theia/ai-core';
 import { Disposable, DisposableCollection } from '@theia/core';
 import { inject, injectable, postConstruct } from '@theia/core/shared/inversify';
-import { CopilotLanguageModelsManager, CopilotModelDescription, COPILOT_PROVIDER_ID, getCopilotApiBaseUrl } from '../common';
+import { CopilotLanguageModelsManager, CopilotModelDescription, COPILOT_PROVIDER_ID, getCopilotApiBaseUrl, CopilotModelData } from '../common';
 import { CopilotOAuthConfig } from '../common/copilot-oauth-config';
 import { CopilotLanguageModel } from './copilot-language-model';
+import { CopilotAnthropicLanguageModel } from './copilot-anthropic-language-model';
 import { CopilotAuthServiceImpl } from './copilot-auth-service-impl';
+import { OpenAiModelUtils } from '@theia/ai-openai/lib/node/openai-language-model';
+import { OpenAiResponseApiUtils } from '@theia/ai-openai/lib/node/openai-response-api-utils';
+
+interface CopilotModelResponseData {
+    id: string;
+    capabilities?: {
+        family?: string;
+        supports?: {
+            structured_output?: boolean;
+            reasoning_effort?: string[];
+            streaming?: boolean;
+        };
+    };
+    vendor: string;
+    supported_endpoints?: string[];
+};
 
 /**
  * Backend implementation of the Copilot language models manager.
@@ -37,6 +54,12 @@ export class CopilotLanguageModelsManagerImpl implements CopilotLanguageModelsMa
 
     @inject(CopilotOAuthConfig)
     protected readonly oauthConfig: CopilotOAuthConfig;
+
+    @inject(OpenAiModelUtils)
+    protected readonly openAiModelUtils: OpenAiModelUtils;
+
+    @inject(OpenAiResponseApiUtils)
+    protected readonly responseApiUtils: OpenAiResponseApiUtils;
 
     protected enterpriseUrl: string | undefined;
     protected readonly toDispose = new DisposableCollection();
@@ -68,34 +91,68 @@ export class CopilotLanguageModelsManagerImpl implements CopilotLanguageModelsMa
         const status = await this.calculateStatus();
 
         for (const modelDescription of modelDescriptions) {
-            const model = await this.languageModelRegistry.getLanguageModel(modelDescription.id);
+            let existingModel = await this.languageModelRegistry.getLanguageModel(modelDescription.id);
+            const isAnthropicModel = modelDescription.vendor === 'Anthropic';
+            const useResponseApi = modelDescription.useResponseApi ?? false;
 
-            if (model) {
-                if (!(model instanceof CopilotLanguageModel)) {
+            if (existingModel) {
+                if (!(existingModel instanceof CopilotLanguageModel) && !(existingModel instanceof CopilotAnthropicLanguageModel)) {
                     console.warn(`Copilot: model ${modelDescription.id} is not a Copilot model`);
                     continue;
                 }
-                await this.languageModelRegistry.patchLanguageModel<CopilotLanguageModel>(modelDescription.id, {
-                    model: modelDescription.model,
-                    enableStreaming: modelDescription.enableStreaming,
-                    supportsStructuredOutput: modelDescription.supportsStructuredOutput,
-                    status,
-                    maxRetries: modelDescription.maxRetries
-                });
-            } else {
-                this.languageModelRegistry.addLanguageModels([
-                    new CopilotLanguageModel(
-                        modelDescription.id,
-                        modelDescription.model,
+                if (isAnthropicModel && existingModel instanceof CopilotAnthropicLanguageModel) {
+                    await this.languageModelRegistry.patchLanguageModel<CopilotAnthropicLanguageModel>(modelDescription.id, {
+                        model: modelDescription.model,
+                        enableStreaming: modelDescription.enableStreaming,
                         status,
-                        modelDescription.enableStreaming,
-                        modelDescription.supportsStructuredOutput,
-                        modelDescription.maxRetries,
-                        () => this.authService.getAccessToken(),
-                        () => this.enterpriseUrl,
-                        () => this.oauthConfig.userAgent
-                    )
-                ]);
+                        maxRetries: modelDescription.maxRetries
+                    });
+                } else if (!isAnthropicModel && existingModel instanceof CopilotLanguageModel) {
+                    await this.languageModelRegistry.patchLanguageModel<CopilotLanguageModel>(modelDescription.id, {
+                        model: modelDescription.model,
+                        enableStreaming: modelDescription.enableStreaming,
+                        supportsStructuredOutput: modelDescription.supportsStructuredOutput,
+                        status,
+                        maxRetries: modelDescription.maxRetries
+                    });
+                } else {
+                    // Model type has changed (e.g. from OpenAI to Claude), replace it
+                    this.languageModelRegistry.removeLanguageModels([modelDescription.id]);
+                    existingModel = undefined;
+                }
+            }
+            if (!existingModel) {
+                if (isAnthropicModel) {
+                    this.languageModelRegistry.addLanguageModels([
+                        new CopilotAnthropicLanguageModel(
+                            modelDescription.id,
+                            modelDescription.model,
+                            status,
+                            modelDescription.enableStreaming,
+                            modelDescription.maxRetries,
+                            () => this.authService.getAccessToken(),
+                            () => this.enterpriseUrl,
+                            () => this.oauthConfig.userAgent
+                        )
+                    ]);
+                } else {
+                    this.languageModelRegistry.addLanguageModels([
+                        new CopilotLanguageModel(
+                            modelDescription.id,
+                            modelDescription.model,
+                            status,
+                            modelDescription.enableStreaming,
+                            modelDescription.supportsStructuredOutput,
+                            modelDescription.maxRetries,
+                            this.openAiModelUtils,
+                            this.responseApiUtils,
+                            useResponseApi,
+                            () => this.authService.getAccessToken(),
+                            () => this.enterpriseUrl,
+                            () => this.oauthConfig.userAgent
+                        )
+                    ]);
+                }
             }
         }
     }
@@ -109,7 +166,8 @@ export class CopilotLanguageModelsManagerImpl implements CopilotLanguageModelsMa
         const allModels = await this.languageModelRegistry.getLanguageModels();
 
         for (const model of allModels) {
-            if (model instanceof CopilotLanguageModel && model.id.startsWith(`${COPILOT_PROVIDER_ID}/`)) {
+            if ((model instanceof CopilotLanguageModel || model instanceof CopilotAnthropicLanguageModel)
+                && model.id.startsWith(`${COPILOT_PROVIDER_ID}/`)) {
                 await this.languageModelRegistry.patchLanguageModel<CopilotLanguageModel>(model.id, {
                     status
                 });
@@ -117,7 +175,19 @@ export class CopilotLanguageModelsManagerImpl implements CopilotLanguageModelsMa
         }
     }
 
-    async fetchAvailableModelIds(): Promise<string[]> {
+    async fetchAvailableModels(): Promise<CopilotModelData[]> {
+        const models = await this.internalFetchAvailableModels();
+        return models.map(m => ({
+            id: m.id,
+            useResponseApi: m.supported_endpoints?.includes('/responses'),
+            vendor: m.vendor,
+            supportsStructuredOutput: m.capabilities?.supports?.structured_output,
+            supportsReasoning: (m.capabilities?.supports?.reasoning_effort?.length ?? 0) > 0,
+            supportsStreaming: m.capabilities?.supports?.streaming
+        }));
+    }
+
+    private async internalFetchAvailableModels(): Promise<CopilotModelResponseData[]> {
         const accessToken = await this.authService.getAccessToken();
         if (!accessToken) {
             return [];
@@ -130,6 +200,7 @@ export class CopilotLanguageModelsManagerImpl implements CopilotLanguageModelsMa
                 headers: {
                     'Authorization': `Bearer ${accessToken}`,
                     'User-Agent': this.oauthConfig.userAgent,
+                    'Copilot-Integration-Id': 'vscode-chat',
                     'Accept': 'application/json'
                 }
             });
@@ -140,12 +211,14 @@ export class CopilotLanguageModelsManagerImpl implements CopilotLanguageModelsMa
             }
 
             const data = await response.json() as {
-                data?: Array<{ id: string; capabilities?: { family?: string } }>
+                data?: Array<CopilotModelResponseData>;
             };
+            // eslint-disable-next-line no-null/no-null
+            console.log('response data', JSON.stringify(data, null, 2));
             const models = data.data ?? [];
-            const modelIds = this.deduplicateModels(models);
-            console.log(`Copilot: discovered ${modelIds.length} available models: ${modelIds.join(', ')}`);
-            return modelIds;
+            const deduplicatedModels = this.deduplicateModels(models);
+            console.log(`Copilot: discovered ${deduplicatedModels.length} available models: ${deduplicatedModels.map(m => m.id).join(', ')}`);
+            return deduplicatedModels;
         } catch (error) {
             console.warn('Copilot: failed to fetch available models:', error);
             return [];
@@ -159,10 +232,10 @@ export class CopilotLanguageModelsManagerImpl implements CopilotLanguageModelsMa
      * We keep only the family alias when it exists, falling back to
      * the versioned ID otherwise.
      */
-    protected deduplicateModels(models: Array<{ id: string; capabilities?: { family?: string } }>): string[] {
-        const allIds = new Set(models.map(m => m.id));
-        const result: string[] = [];
-        const seenFamilies = new Set<string>();
+    protected deduplicateModels(models: Array<CopilotModelResponseData>): CopilotModelResponseData[] {
+        const allIds = new Map<string, CopilotModelResponseData>(models.map(m => [m.id, m]));
+        const result: CopilotModelResponseData[] = [];
+        const seenFamilies = new Map<string, CopilotModelResponseData>();
 
         for (const model of models) {
             const family = model.capabilities?.family;
@@ -170,15 +243,15 @@ export class CopilotLanguageModelsManagerImpl implements CopilotLanguageModelsMa
                 continue;
             }
             if (family) {
-                seenFamilies.add(family);
+                seenFamilies.set(family, model);
                 // Prefer the family alias if it exists as a model ID
                 if (allIds.has(family)) {
-                    result.push(family);
+                    result.push(allIds.get(family)!);
                 } else {
-                    result.push(model.id);
+                    result.push(model);
                 }
             } else {
-                result.push(model.id);
+                result.push(model);
             }
         }
 

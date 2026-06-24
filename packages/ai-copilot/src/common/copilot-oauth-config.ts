@@ -48,7 +48,7 @@ export interface CopilotOAuthConfig {
  * Default OAuth configuration for the built-in Theia Copilot integration.
  */
 export const DEFAULT_COPILOT_OAUTH_CONFIG: CopilotOAuthConfig = {
-    clientId: 'Ov23liS2vINy9VOAweyv',
+    clientId: '01ab8ac9400c4e429b23',
     userAgent: 'Theia-Copilot/1.0.0',
     keystoreService: 'theia-copilot-auth',
     keystoreAccount: 'github-copilot'

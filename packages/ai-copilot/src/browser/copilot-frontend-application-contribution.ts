@@ -18,7 +18,7 @@ import { inject, injectable } from '@theia/core/shared/inversify';
 import { CommandService, nls, PreferenceService } from '@theia/core';
 import { FrontendApplicationContribution } from '@theia/core/lib/browser';
 import { MessageService } from '@theia/core/lib/common/message-service';
-import { CopilotAuthService, CopilotLanguageModelsManager, CopilotModelDescription, COPILOT_PROVIDER_ID } from '../common';
+import { CopilotAuthService, CopilotLanguageModelsManager, CopilotModelDescription, COPILOT_PROVIDER_ID, CopilotModelData } from '../common';
 import { COPILOT_ENABLED_PREF, COPILOT_MODEL_OVERRIDES_PREF, COPILOT_ENTERPRISE_URL_PREF } from '../common/copilot-preferences';
 import { AICorePreferences, PREFERENCE_NAME_MAX_RETRIES } from '@theia/ai-core/lib/common/ai-core-preferences';
 import { CopilotCommands } from './copilot-command-contribution';
@@ -116,7 +116,7 @@ export class CopilotFrontendApplicationContribution implements FrontendApplicati
         if (configuredModels.length > 0) {
             this.useAutoDiscovery = false;
             this.manager.createOrUpdateLanguageModels(
-                ...configuredModels.map((modelId: string) => this.createCopilotModelDescription(modelId))
+                ...configuredModels.map((modelId: string) => this.createCopilotModelDescription({ id: modelId }))
             );
             this.prevModels = [...configuredModels];
         } else {
@@ -126,18 +126,19 @@ export class CopilotFrontendApplicationContribution implements FrontendApplicati
     }
 
     protected async discoverAndRegisterModels(): Promise<void> {
-        const modelIds = await this.manager.fetchAvailableModelIds();
-        if (modelIds.length > 0) {
-            const modelsToRemove = this.prevModels.filter(m => !modelIds.includes(m));
+        const allModelData = await this.manager.fetchAvailableModels();
+        const allModelIds = allModelData.map(model => model.id);
+        if (allModelData.length > 0) {
+            const modelsToRemove = this.prevModels.filter(m => !allModelIds.includes(m));
             if (modelsToRemove.length > 0) {
                 this.manager.removeLanguageModels(
                     ...modelsToRemove.map(model => `${COPILOT_PROVIDER_ID}/${model}`)
                 );
             }
             this.manager.createOrUpdateLanguageModels(
-                ...modelIds.map((modelId: string) => this.createCopilotModelDescription(modelId))
+                ...allModelData.map((model: CopilotModelData) => this.createCopilotModelDescription(model))
             );
-            this.prevModels = [...modelIds];
+            this.prevModels = [...allModelIds];
         }
     }
 
@@ -158,7 +159,7 @@ export class CopilotFrontendApplicationContribution implements FrontendApplicati
         const modelsToAdd = [...updatedModels].filter(model => !oldModels.has(model));
 
         this.manager.removeLanguageModels(...modelsToRemove.map(model => `${COPILOT_PROVIDER_ID}/${model}`));
-        this.manager.createOrUpdateLanguageModels(...modelsToAdd.map((modelId: string) => this.createCopilotModelDescription(modelId)));
+        this.manager.createOrUpdateLanguageModels(...modelsToAdd.map((modelId: string) => this.createCopilotModelDescription({ id: modelId })));
         this.prevModels = [...newModels];
     }
 
@@ -168,7 +169,7 @@ export class CopilotFrontendApplicationContribution implements FrontendApplicati
             return;
         }
         const models = this.preferenceService.get<string[]>(COPILOT_MODEL_OVERRIDES_PREF, []);
-        this.manager.createOrUpdateLanguageModels(...models.map((modelId: string) => this.createCopilotModelDescription(modelId)));
+        this.manager.createOrUpdateLanguageModels(...models.map((modelId: string) => this.createCopilotModelDescription({ id: modelId })));
     }
 
     protected async notifyTokenMigration(): Promise<void> {
@@ -183,15 +184,17 @@ export class CopilotFrontendApplicationContribution implements FrontendApplicati
         }
     }
 
-    protected createCopilotModelDescription(modelId: string): CopilotModelDescription {
-        const id = `${COPILOT_PROVIDER_ID}/${modelId}`;
+    protected createCopilotModelDescription(model: CopilotModelData): CopilotModelDescription {
+        const id = `${COPILOT_PROVIDER_ID}/${model.id}`;
         const maxRetries = this.aiCorePreferences.get(PREFERENCE_NAME_MAX_RETRIES) ?? 3;
 
         return {
             id,
-            model: modelId,
-            enableStreaming: true,
-            supportsStructuredOutput: true,
+            model: model.id,
+            vendor: model.vendor,
+            enableStreaming: model.supportsStreaming ?? false,
+            supportsStructuredOutput: model.supportsStructuredOutput ?? false,
+            useResponseApi: model.useResponseApi ?? false,
             maxRetries
         };
     }

@@ -29,6 +29,7 @@ import {
 import { CancellationToken, unreachable } from '@theia/core';
 import { Deferred } from '@theia/core/lib/common/promise-util';
 import { injectable } from '@theia/core/shared/inversify';
+import { createHash } from 'crypto';
 import { OpenAI } from 'openai';
 import type { RunnerOptions } from 'openai/lib/AbstractChatCompletionRunner';
 import type {
@@ -53,6 +54,8 @@ interface ToolCall {
     executed: boolean;
 }
 
+const RESPONSE_API_CALL_ID_MAX_LENGTH = 64;
+
 /**
  * Utility class for handling OpenAI Response API requests and tool calling cycles.
  *
@@ -61,6 +64,13 @@ interface ToolCall {
  */
 @injectable()
 export class OpenAiResponseApiUtils {
+
+    toResponseApiCallId(callId: string): string {
+        if (callId.length <= RESPONSE_API_CALL_ID_MAX_LENGTH) {
+            return callId;
+        }
+        return `call_${createHash('sha256').update(callId).digest('hex').slice(0, 32)}`;
+    }
 
     /**
      * Handles Response API requests with proper tool calling cycles.
@@ -265,7 +275,7 @@ export class OpenAiResponseApiUtils {
             } else if (LanguageModelMessage.isToolUseMessage(message)) {
                 input.push({
                     type: 'function_call',
-                    call_id: message.id,
+                    call_id: this.toResponseApiCallId(message.id),
                     name: message.name,
                     arguments: JSON.stringify(message.input)
                 });
@@ -273,7 +283,7 @@ export class OpenAiResponseApiUtils {
                 const content = typeof message.content === 'string' ? message.content : JSON.stringify(message.content);
                 input.push({
                     type: 'function_call_output',
-                    call_id: message.tool_use_id,
+                    call_id: this.toResponseApiCallId(message.tool_use_id),
                     output: content
                 });
             } else if (LanguageModelMessage.isImageMessage(message)) {
@@ -319,6 +329,7 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
     // Current iteration state
     protected currentInput: ResponseInputItem[];
     protected currentToolCalls = new Map<string, ToolCall>();
+    protected currentToolCallIdsByOutputIndex = new Map<number, string>();
     protected iteration = 0;
     protected readonly maxIterations: number;
     protected readonly tools: FunctionTool[] | undefined;
@@ -394,6 +405,11 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
                 // Execute all tool calls
                 await this.executeToolCalls();
 
+                if (this.currentToolCalls.size === 0) {
+                    this.finalize();
+                    return;
+                }
+
                 // Prepare for next iteration
                 this.prepareNextIteration();
                 this.iteration++;
@@ -409,6 +425,7 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
 
     protected async processStream(): Promise<void> {
         this.currentToolCalls.clear();
+        this.currentToolCallIdsByOutputIndex.clear();
         this.currentResponseText = '';
 
         if (this.isStreaming) {
@@ -462,9 +479,10 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
         // Process each function call
         for (const functionCall of functionCalls) {
             if (functionCall.id && functionCall.name) {
+                const callId = this.utils.toResponseApiCallId(functionCall.call_id || functionCall.id);
                 const toolCall: ToolCall = {
                     id: functionCall.id,
-                    call_id: functionCall.call_id || functionCall.id,
+                    call_id: callId,
                     name: functionCall.name,
                     arguments: functionCall.arguments || '',
                     executed: false
@@ -475,7 +493,7 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
                 // Yield the tool call initiation
                 this.handleIncoming({
                     tool_calls: [{
-                        id: functionCall.id,
+                        id: callId,
                         finished: false,
                         function: {
                             name: functionCall.name,
@@ -496,7 +514,7 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
 
             case 'response.output_item.added':
                 if (event.item?.type === 'function_call') {
-                    this.handleFunctionCallAdded(event.item);
+                    this.handleFunctionCallAdded(event.item, event.output_index);
                 }
                 break;
 
@@ -510,7 +528,7 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
 
             case 'response.output_item.done':
                 if (event.item?.type === 'function_call') {
-                    this.handleFunctionCallDone(event.item);
+                    this.handleFunctionCallDone(event.item, event.output_index);
                 }
                 break;
 
@@ -529,23 +547,25 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
         }
     }
 
-    protected handleFunctionCallAdded(functionCall: ResponseFunctionToolCall): void {
-        if (functionCall.id && functionCall.call_id) {
+    protected handleFunctionCallAdded(functionCall: ResponseFunctionToolCall, outputIndex: number): void {
+        if (functionCall.id) {
             console.debug(`Function call added: ${functionCall.name} with id ${functionCall.id} and call_id ${functionCall.call_id}`);
+            const callId = this.utils.toResponseApiCallId(functionCall.call_id || functionCall.id);
 
             const toolCall: ToolCall = {
                 id: functionCall.id,
-                call_id: functionCall.call_id,
+                call_id: callId,
                 name: functionCall.name || '',
                 arguments: functionCall.arguments || '',
                 executed: false
             };
 
             this.currentToolCalls.set(functionCall.id, toolCall);
+            this.currentToolCallIdsByOutputIndex.set(outputIndex, functionCall.id);
 
             this.handleIncoming({
                 tool_calls: [{
-                    id: functionCall.id,
+                    id: callId,
                     finished: false,
                     function: {
                         name: functionCall.name || '',
@@ -557,14 +577,15 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
     }
 
     protected handleFunctionCallArgsDelta(event: ResponseFunctionCallArgumentsDeltaEvent): void {
-        const toolCall = this.currentToolCalls.get(event.item_id);
+        const toolCall = this.getToolCallForEvent(event.item_id, event.output_index);
         if (toolCall) {
             toolCall.arguments += event.delta;
+            const callId = toolCall.call_id || this.utils.toResponseApiCallId(event.item_id);
 
             if (event.delta) {
                 this.handleIncoming({
                     tool_calls: [{
-                        id: event.item_id,
+                        id: callId,
                         argumentsDelta: true,
                         function: {
                             arguments: event.delta
@@ -576,20 +597,23 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
     }
 
     protected async handleFunctionCallArgsDone(event: ResponseFunctionCallArgumentsDoneEvent): Promise<void> {
-        let toolCall = this.currentToolCalls.get(event.item_id);
+        let toolCall = this.getToolCallForEvent(event.item_id, event.output_index);
         if (!toolCall) {
             // Create if we didn't see the added event
             toolCall = {
                 id: event.item_id,
+                call_id: this.utils.toResponseApiCallId(event.item_id),
                 name: event.name || '',
                 arguments: event.arguments || '',
                 executed: false
             };
+            const callId = toolCall.call_id;
             this.currentToolCalls.set(event.item_id, toolCall);
+            this.currentToolCallIdsByOutputIndex.set(event.output_index, event.item_id);
 
             this.handleIncoming({
                 tool_calls: [{
-                    id: event.item_id,
+                    id: callId,
                     finished: false,
                     function: {
                         name: event.name || '',
@@ -604,12 +628,29 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
         }
     }
 
-    protected handleFunctionCallDone(functionCall: ResponseFunctionToolCall): void {
-        if (!functionCall.id) { console.warn('Unexpected absence of ID for call ID', functionCall.call_id); return; }
-        const toolCall = this.currentToolCalls.get(functionCall.id);
-        if (toolCall && !toolCall.call_id && functionCall.call_id) {
-            toolCall.call_id = functionCall.call_id;
+    protected handleFunctionCallDone(functionCall: ResponseFunctionToolCall, outputIndex: number): void {
+        const itemId = functionCall.id || this.currentToolCallIdsByOutputIndex.get(outputIndex);
+        if (!itemId) { console.warn('Unexpected absence of ID for call ID', functionCall.call_id); return; }
+        const toolCall = this.currentToolCalls.get(itemId);
+        if (toolCall) {
+            if (functionCall.call_id) {
+                toolCall.call_id = this.utils.toResponseApiCallId(functionCall.call_id);
+            }
+            toolCall.name = functionCall.name || toolCall.name;
+            toolCall.arguments = functionCall.arguments || toolCall.arguments;
         }
+    }
+
+    protected getToolCallForEvent(itemId: string, outputIndex: number): ToolCall | undefined {
+        return this.currentToolCalls.get(itemId)
+            ?? this.currentToolCalls.get(this.currentToolCallIdsByOutputIndex.get(outputIndex) ?? '');
+    }
+
+    protected resolveToolName(toolCall: ToolCall): string | undefined {
+        if (toolCall.name) {
+            return toolCall.name;
+        }
+        return this.request.tools?.length === 1 ? this.request.tools[0].name : undefined;
     }
 
     protected async executeToolCalls(): Promise<void> {
@@ -618,16 +659,25 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
                 continue;
             }
 
-            const tool = this.request.tools?.find(t => t.name === toolCall.name);
+            const toolName = this.resolveToolName(toolCall);
+            if (!toolName) {
+                console.warn(`Skipping Response API tool call ${itemId}: missing function name`);
+                this.currentToolCalls.delete(itemId);
+                continue;
+            }
+            toolCall.name = toolName;
+
+            const tool = this.request.tools?.find(t => t.name === toolName);
             if (tool) {
                 try {
                     const result = await tool.handler(toolCall.arguments, ToolInvocationContext.create(itemId));
                     toolCall.result = result;
+                    const callId = toolCall.call_id || this.utils.toResponseApiCallId(itemId);
 
                     // Yield the tool call completion
                     this.handleIncoming({
                         tool_calls: [{
-                            id: itemId,
+                            id: callId,
                             finished: true,
                             function: {
                                 name: toolCall.name,
@@ -639,11 +689,12 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
                 } catch (error) {
                     console.error(`Error executing tool ${toolCall.name}:`, error);
                     toolCall.error = error instanceof Error ? error : new Error(String(error));
+                    const callId = toolCall.call_id || this.utils.toResponseApiCallId(itemId);
 
                     // Yield the tool call error
                     this.handleIncoming({
                         tool_calls: [{
-                            id: itemId,
+                            id: callId,
                             finished: true,
                             function: {
                                 name: toolCall.name,
@@ -656,11 +707,12 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
             } else {
                 console.warn(`Tool ${toolCall.name} not found in request tools`);
                 toolCall.error = new Error(`Tool ${toolCall.name} not found`);
+                const callId = toolCall.call_id || this.utils.toResponseApiCallId(itemId);
 
                 // Yield the tool call error
                 this.handleIncoming({
                     tool_calls: [{
-                        id: itemId,
+                        id: callId,
                         finished: true,
                         function: {
                             name: toolCall.name,
@@ -685,9 +737,13 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
         // Add the function calls that were made by the assistant
         const functionCalls: ResponseInputItem[] = [];
         for (const [itemId, toolCall] of this.currentToolCalls) {
+            if (!toolCall.name) {
+                continue;
+            }
+            const callId = toolCall.call_id || this.utils.toResponseApiCallId(itemId);
             functionCalls.push({
                 type: 'function_call',
-                call_id: toolCall.call_id || itemId,
+                call_id: callId,
                 name: toolCall.name,
                 arguments: toolCall.arguments
             });
@@ -696,7 +752,10 @@ class ResponseApiToolCallIterator implements AsyncIterableIterator<LanguageModel
         // Add tool results
         const toolResults: ResponseInputItem[] = [];
         for (const [itemId, toolCall] of this.currentToolCalls) {
-            const callId = toolCall.call_id || itemId;
+            if (!toolCall.name) {
+                continue;
+            }
+            const callId = toolCall.call_id || this.utils.toResponseApiCallId(itemId);
 
             if (toolCall.result !== undefined) {
                 const resultContent = typeof toolCall.result === 'string' ? toolCall.result : JSON.stringify(toolCall.result);

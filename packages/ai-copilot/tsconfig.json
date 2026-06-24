@@ -10,6 +10,9 @@
   ],
   "references": [
     {
+      "path": "../ai-anthropic"
+    },
+    {
       "path": "../ai-core"
     },
     {

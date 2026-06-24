@@ -25,14 +25,16 @@ import {
     LanguageModelTextResponse,
     UserRequest
 } from '@theia/ai-core';
+import { StreamingAsyncIterator } from '@theia/ai-openai/lib/node/openai-streaming-iterator';
+import { OpenAiResponseApiUtils } from '@theia/ai-openai/lib/node/openai-response-api-utils';
+import { OpenAiModelUtils } from '@theia/ai-openai/lib/node/openai-language-model';
 import { CancellationToken } from '@theia/core';
 import OpenAI from 'openai';
-import { RunnableToolFunctionWithoutParse } from 'openai/lib/RunnableFunction';
-import { ChatCompletionAssistantMessageParam, ChatCompletionMessageParam } from 'openai/resources';
-import { StreamingAsyncIterator } from '@theia/ai-openai/lib/node/openai-streaming-iterator';
-import { COPILOT_PROVIDER_ID, getCopilotApiBaseUrl } from '../common';
 import type { RunnerOptions } from 'openai/lib/AbstractChatCompletionRunner';
 import type { ChatCompletionStream } from 'openai/lib/ChatCompletionStream';
+import { RunnableToolFunctionWithoutParse } from 'openai/lib/RunnableFunction';
+import { ChatCompletionAssistantMessageParam, ChatCompletionMessageParam } from 'openai/resources';
+import { COPILOT_PROVIDER_ID, getCopilotApiBaseUrl } from '../common';
 
 /**
  * Language model implementation for GitHub Copilot.
@@ -51,10 +53,14 @@ export class CopilotLanguageModel implements LanguageModel {
         public enableStreaming: boolean,
         public supportsStructuredOutput: boolean,
         public maxRetries: number,
+        public openAiModelUtils: OpenAiModelUtils,
+        public responseApiUtils: OpenAiResponseApiUtils,
+        public useResponseApi: boolean,
         protected readonly accessTokenProvider: () => Promise<string | undefined>,
         protected readonly enterpriseUrlProvider: () => string | undefined,
         protected readonly userAgentProvider: () => string,
-    ) { }
+    ) {
+    }
 
     protected getSettings(request: LanguageModelRequest): Record<string, unknown> {
         return request.settings ?? {};
@@ -63,50 +69,9 @@ export class CopilotLanguageModel implements LanguageModel {
     async request(request: UserRequest, cancellationToken?: CancellationToken): Promise<LanguageModelResponse> {
         const openai = await this.initializeCopilotClient();
 
-        if (request.response_format?.type === 'json_schema' && this.supportsStructuredOutput) {
-            return this.handleStructuredOutputRequest(openai, request);
-        }
-
-        const settings = this.getSettings(request);
-
-        if (!this.enableStreaming || (typeof settings.stream === 'boolean' && !settings.stream)) {
-            return this.handleNonStreamingRequest(openai, request);
-        }
-
-        if (cancellationToken?.isCancellationRequested) {
-            return { text: '' };
-        }
-
-        if (this.id.startsWith(`${COPILOT_PROVIDER_ID}/`)) {
-            settings['stream_options'] = { include_usage: true };
-        }
-
-        let runner: ChatCompletionStream;
-        const tools = this.createTools(request);
-
-        if (tools) {
-            runner = openai.chat.completions.runTools({
-                model: this.model,
-                messages: this.processMessages(request.messages),
-                stream: true,
-                tools: tools,
-                tool_choice: 'auto',
-                ...settings
-            }, {
-                ...this.runnerOptions,
-                maxRetries: this.maxRetries
-            });
-        } else {
-            runner = openai.chat.completions.stream({
-                model: this.model,
-                messages: this.processMessages(request.messages),
-                stream: true,
-                ...settings
-            });
-        }
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return { stream: new StreamingAsyncIterator(runner as any, cancellationToken) };
+        return this.useResponseApi ?
+            this.handleResponseApiRequest(openai, request, cancellationToken)
+            : this.handleChatCompletionsRequest(openai, request, cancellationToken);
     }
 
     protected async handleNonStreamingRequest(openai: OpenAI, request: UserRequest): Promise<LanguageModelTextResponse> {
@@ -177,10 +142,83 @@ export class CopilotLanguageModel implements LanguageModel {
             baseURL,
             defaultHeaders: {
                 'User-Agent': this.userAgentProvider(),
-                'Openai-Intent': 'conversation-edits',
-                'X-Initiator': 'user'
+                'Copilot-Integration-Id': 'vscode-chat'
             }
         });
+    }
+
+    protected async handleChatCompletionsRequest(openai: OpenAI, request: UserRequest, cancellationToken?: CancellationToken): Promise<LanguageModelResponse> {
+        if (request.response_format?.type === 'json_schema' && this.supportsStructuredOutput) {
+            return this.handleStructuredOutputRequest(openai, request);
+        }
+
+        const settings = this.getSettings(request);
+
+        if (!this.enableStreaming || (typeof settings.stream === 'boolean' && !settings.stream)) {
+            return this.handleNonStreamingRequest(openai, request);
+        }
+
+        if (cancellationToken?.isCancellationRequested) {
+            return { text: '' };
+        }
+
+        if (this.id.startsWith(`${COPILOT_PROVIDER_ID}/`)) {
+            settings['stream_options'] = { include_usage: true };
+        }
+
+        let runner: ChatCompletionStream;
+        const tools = this.createTools(request);
+
+        if (tools) {
+            runner = openai.chat.completions.runTools({
+                model: this.model,
+                messages: this.processMessages(request.messages),
+                stream: true,
+                tools: tools,
+                tool_choice: 'auto',
+                ...settings
+            }, {
+                ...this.runnerOptions,
+                maxRetries: this.maxRetries
+            });
+        } else {
+            runner = openai.chat.completions.stream({
+                model: this.model,
+                messages: this.processMessages(request.messages),
+                stream: true,
+                ...settings
+            });
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return { stream: new StreamingAsyncIterator(runner as any, cancellationToken) };
+    }
+
+    protected async handleResponseApiRequest(openai: OpenAI, request: UserRequest, cancellationToken?: CancellationToken): Promise<LanguageModelResponse> {
+        const settings = this.getSettings(request);
+        const isStreamingRequest = this.enableStreaming && !(typeof settings.stream === 'boolean' && !settings.stream);
+
+        try {
+            return await this.responseApiUtils.handleRequest(
+                openai,
+                request,
+                settings,
+                this.model,
+                this.openAiModelUtils,
+                'developer',
+                this.runnerOptions,
+                this.id,
+                isStreamingRequest,
+                cancellationToken
+            );
+        } catch (error) {
+            // If Response API fails, fall back to Chat Completions API
+            if (error instanceof Error) {
+                console.warn(`Response API failed for model ${this.id}, falling back to Chat Completions API:`, error.message);
+                return this.handleChatCompletionsRequest(openai, request, cancellationToken);
+            }
+            throw error;
+        }
     }
 
     protected processMessages(messages: LanguageModelMessage[]): ChatCompletionMessageParam[] {

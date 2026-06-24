@@ -3,8 +3,10 @@
   "version": "1.72.0",
   "description": "Theia - GitHub Copilot Integration",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.92.0",
     "@theia/ai-core": "1.72.0",
     "@theia/ai-openai": "1.72.0",
+    "@theia/ai-anthropic": "1.72.0",
     "@theia/core": "1.72.0",
     "openai": "^6.35.0",
     "tslib": "^2.8.1"
